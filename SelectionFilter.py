@@ -23,7 +23,13 @@
 
 import os
 
-from qgis.core import Qgis, QgsMapLayerType, QgsProject
+from qgis.core import (
+    Qgis,
+    QgsFeatureRequest,
+    QgsFieldConstraints,
+    QgsMapLayerType,
+    QgsProject,
+)
 from qgis.PyQt.QtCore import QCoreApplication
 
 #from qgis.PyQt.QtWidgets import QAction
@@ -31,6 +37,15 @@ from qgis.PyQt.QtGui import QAction, QIcon
 from qgis.utils import iface
 
 from .setUniqueField import setUniqueFieldPopup
+
+# QGIS 4 requires the scoped enum; QGIS 3 exposes it unscoped.
+NO_GEOMETRY = getattr(QgsFeatureRequest, "Flag", QgsFeatureRequest).NoGeometry
+CONSTRAINT_UNIQUE = getattr(
+    QgsFieldConstraints, "Constraint", QgsFieldConstraints).ConstraintUnique
+
+# Counting distinct values is a full table scan, so only pay for it on layers
+# small enough that the user will not notice the dialog stalling.
+UNIQUE_CHECK_LIMIT = 100000
 
 
 class SelectionFilter:
@@ -135,43 +150,180 @@ class SelectionFilter:
             pass
 
       
-    def _format_query(self, field, field_type, values, operator):
-        if not values:
-            return "1 = 1" if operator == "NOT IN" else "1 = 0"
-        if len(values) > 1:
-            return f"{field} {operator} {tuple(values)}"
-        if field_type == 10:
-            return f"{field} {operator} ('{values[0]}')"
-        return f"{field} {operator} ({values[0]})"
+    def _is_null(self, value) -> bool:
+        """True for a NULL attribute on both QGIS 3 (QVariant) and QGIS 4 (None)."""
+        if value is None:
+            return True
+        is_null = getattr(value, "isNull", None)
+        return bool(is_null()) if callable(is_null) else False
 
-    def _shorter_query(self, field, field_type, in_values, not_in_values):
-        """Return IN (in_values) or NOT IN (not_in_values), whichever list is shorter."""
-        if not_in_values and len(not_in_values) < len(in_values):
-            return self._format_query(field, field_type, not_in_values, "NOT IN")
-        return self._format_query(field, field_type, in_values, "IN")
+    def _quote_value(self, value, field_type) -> str:
+        """Render one attribute value as a provider-safe SQL literal."""
+        if self._is_null(value):
+            return "NULL"
+        if isinstance(value, bool):
+            return "TRUE" if value else "FALSE"
+        if isinstance(value, (int, float)):
+            return str(value)
+        for to_python in ("toPyDateTime", "toPyDate", "toPyTime"):
+            converter = getattr(value, to_python, None)
+            if callable(converter):
+                value = converter()
+                break
+        return "'" + str(value).replace("'", "''") + "'"
 
-    def _build_query(self, layer, field, field_type, show_selected):
-        selected_unique = list(set(f[field] for f in layer.selectedFeatures()))
-        prior_subset = layer.subsetString()
+    def _literals(self, values, field_type) -> list:
+        """Render values as SQL literals; NULL stays bare so clauses can spot it."""
+        return [self._quote_value(value, field_type) for value in values]
 
-        layer.invertSelection()
-        inverted_unique = list(set(f[field] for f in layer.selectedFeatures()))
-        layer.invertSelection()  # restore original selection
+    def _format_literals(self, field, literals, operator) -> str:
+        """Build an IN / NOT IN clause from already-quoted literals."""
+        ident = f'"{field}"'
+        has_null = "NULL" in literals
+        literals = [literal for literal in literals if literal != "NULL"]
+
+        if operator == "NOT IN":
+            if not literals:
+                return f"{ident} IS NOT NULL" if has_null else "1 = 1"
+            clause = f'{ident} NOT IN ({", ".join(literals)})'
+            # `NULL NOT IN (...)` is NULL, never true, so NULL-keyed rows need an
+            # explicit rule or they silently vanish from the layer.
+            if has_null:
+                return f"({clause} AND {ident} IS NOT NULL)"
+            return f"({clause} OR {ident} IS NULL)"
+
+        if not literals:
+            return f"{ident} IS NULL" if has_null else "1 = 0"
+        clause = f'{ident} IN ({", ".join(literals)})'
+        return f"({clause} OR {ident} IS NULL)" if has_null else clause
+
+    def _format_query(self, field, field_type, values, operator) -> str:
+        return self._format_literals(field, self._literals(values, field_type), operator)
+
+    def _unique_values(self, layer, field, fids=None, exclude=None, cap=None):
+        """Distinct values of `field`, read without geometry or other attributes.
+
+        `exclude` drops feature ids from the result, which replaces inverting the
+        selection. `cap` aborts once more than `cap` distinct values are found and
+        returns None, meaning the other side of the comparison is the shorter one.
+        """
+        idx = layer.fields().indexOf(field)
+        request = QgsFeatureRequest()
+        request.setFlags(NO_GEOMETRY)
+        request.setSubsetOfAttributes([idx])
+        if fids is not None:
+            request.setFilterFids(list(fids))
+
+        values = set()
+        for feature in layer.getFeatures(request):
+            if exclude and feature.id() in exclude:
+                continue
+            value = feature[idx]
+            values.add(None if self._is_null(value) else value)
+            if cap is not None and len(values) > cap:
+                return None
+        return values
+
+    def _verify_unique(self, layer, field) -> bool:
+        """Check -- cheaply where possible -- that `field` identifies one feature."""
+        try:
+            idx = layer.fields().indexOf(field)
+            if idx < 0:
+                return False
+            if idx in layer.primaryKeyAttributes():
+                return True
+            if layer.fields().at(idx).constraints().constraints() & CONSTRAINT_UNIQUE:
+                return True
+            if layer.featureCount() > UNIQUE_CHECK_LIMIT:
+                return False
+            return len(layer.uniqueValues(idx)) == layer.featureCount()
+        except Exception:
+            # Unverified only costs the IN/NOT IN swap, so fail closed and quietly.
+            return False
+
+    def _swap_allowed(self, layer) -> bool:
+        """Swapping IN for NOT IN is only equivalent if the field is truly unique."""
+        return bool(layer.customProperty("unique_field_verified", False))
+
+    def _state_properties(self, layer):
+        """Read back the filter this plugin last wrote.
+
+        Returns (base, include_clause, hidden_literals). If the subset string no
+        longer matches what the plugin wrote, someone edited the filter by hand,
+        so the current string becomes the new base and the accumulators reset.
+        """
+        current = layer.subsetString()
+        if current != layer.customProperty("sf_last_subset", None):
+            return current, "", []
+        hidden = layer.customProperty("sf_hidden", []) or []
+        if isinstance(hidden, str):  # Qt collapses a one-item QStringList
+            hidden = [hidden]
+        return (layer.customProperty("sf_base", ""),
+                layer.customProperty("sf_include", ""),
+                list(hidden))
+
+    def _compose(self, base, include, hidden_clause) -> str:
+        """Join the at most three clauses the plugin ever emits."""
+        parts = []
+        if base:
+            parts.append(f"({base})")
+        if include:
+            parts.append(include)
+        if hidden_clause:
+            parts.append(hidden_clause)
+        return "\nAND ".join(parts) if parts else "1 = 1"
+
+    def _build_query(self, layer, field, field_type, show_selected) -> str:
+        base, include, hidden = self._state_properties(layer)
+        selected_ids = set(layer.selectedFeatureIds())
+        selected = self._unique_values(layer, field, fids=selected_ids)
+
+        # The complement costs a full pass, so only pay for it when the swap is
+        # valid, and abort the pass as soon as it is provably the longer side.
+        rest = None
+        if self._swap_allowed(layer):
+            rest = self._unique_values(layer, field, exclude=selected_ids,
+                                       cap=len(selected))
+        rest_is_shorter = rest is not None and len(rest) < len(selected)
+        # `rest` is the complement *within the current view*, so a whole-layer
+        # NOT IN is equivalent only while nothing constrains the layer yet --
+        # neither the user's own filter nor one this plugin already applied.
+        # Narrowing an existing filter otherwise widens it back to the layer.
+        unconstrained = not layer.subsetString()
 
         if show_selected:
-            # IN (selected) always replaces the prior filter cleanly — no AND needed.
-            # NOT IN (inverted) is only safe when there is no prior subset, because
-            # NOT IN on the full layer could expose features outside the prior view.
-            if not prior_subset:
-                return self._shorter_query(field, field_type, selected_unique, inverted_unique)
-            return self._format_query(field, field_type, selected_unique, "IN")
+            # A show replaces everything the plugin had accumulated.
+            if rest_is_shorter and unconstrained:
+                include = self._format_query(field, field_type, rest, "NOT IN")
+            else:
+                include = self._format_query(field, field_type, selected, "IN")
+            hidden = []
+        elif rest_is_shorter:
+            # getFeatures() honours the subset string, so `rest` is already scoped
+            # to the current view and IN (rest) subsumes both prior clauses.
+            include = self._format_query(field, field_type, rest, "IN")
+            hidden = []
         else:
-            # For hide, NOT IN (selected) is short but must be scoped.
-            # Compose with prior_subset via AND when NOT IN is chosen.
-            query = self._shorter_query(field, field_type, inverted_unique, selected_unique)
-            if "NOT IN" in query and prior_subset:
-                return f"{prior_subset}\nAND {query}"
-            return query
+            # Accumulate into a single NOT IN list rather than chaining another
+            # AND clause onto the previous subset, which would grow unbounded.
+            hidden = sorted(set(hidden) | set(self._literals(selected, field_type)))
+
+        hidden_clause = self._format_literals(field, hidden, "NOT IN") if hidden else ""
+        query = self._compose(base, include, hidden_clause)
+        # Committed by _applySelectionFilter only if the provider accepts `query`.
+        self._pending_state = (layer, base, include, hidden, query)
+        return query
+
+    def _commit_state(self, layer) -> None:
+        pending = getattr(self, "_pending_state", None)
+        if not pending or pending[0] is not layer:
+            return
+        _, base, include, hidden, query = pending
+        layer.setCustomProperty("sf_base", base)
+        layer.setCustomProperty("sf_include", include)
+        layer.setCustomProperty("sf_hidden", hidden)
+        layer.setCustomProperty("sf_last_subset", query)
+        self._pending_state = None
 
     def _applySelectionFilter(self, show_selected):
         layer = self.iface.activeLayer()
@@ -192,7 +344,12 @@ class SelectionFilter:
 
         field_type = fields[field]
         query_syntax = self._build_query(layer, field, field_type, show_selected)
-        layer.setSubsetString(query_syntax)
+        if not layer.setSubsetString(query_syntax):
+            iface.messageBar().pushMessage(
+                "The data provider rejected the filter; the layer is unchanged",
+                level=Qgis.Critical)
+            return
+        self._commit_state(layer)
 
         if show_selected:
             feature_count = layer.featureCount()
@@ -210,6 +367,8 @@ class SelectionFilter:
     def clearFilterSelected(self, layer:None):
         layer = self.iface.activeLayer()
         layer.setSubsetString('')
+        for prop in ("sf_base", "sf_include", "sf_hidden", "sf_last_subset"):
+            layer.removeCustomProperty(prop)
             
     def updateFilterActions(self, *args):
         self.iface.removeCustomActionForLayerType(self.create_filter_action)
@@ -250,5 +409,6 @@ class SelectionFilter:
         if ok:
             field = self.popup.comboBoxFields.currentText()
             layer.setCustomProperty("unique_field", field)
+            layer.setCustomProperty("unique_field_verified", self._verify_unique(layer, field))
             iface.messageBar().pushMessage(f"{field} is set for {layer.name()} layer filtering", level=Qgis.Info)
             #return field

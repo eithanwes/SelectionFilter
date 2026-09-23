@@ -4,11 +4,11 @@
 
 [general]
 name=Selection as Filter
-qgisMinimumVersion=3.16
+qgisMinimumVersion=3.34
 qgisMaximumVersion=4.99
 
 description=This plugin makes filter for the selected features
-version=2.0
+version=2.1
 author=Kyaw Naing Win
 email=kyawnaingwinknw@gmail.com
 
