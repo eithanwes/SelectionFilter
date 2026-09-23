@@ -47,6 +47,16 @@ CONSTRAINT_UNIQUE = getattr(
 # small enough that the user will not notice the dialog stalling.
 UNIQUE_CHECK_LIMIT = 100000
 
+ICONS_DIR = os.path.join(os.path.dirname(__file__), "icons")
+
+# The plugin's own icon; also declared as `icon=` in metadata.txt.
+PLUGIN_ICON = "sf_plugin_icon.svg"
+
+
+def plugin_icon(name: str = PLUGIN_ICON) -> QIcon:
+    """Load one of the bundled icons from the plugin's icons folder."""
+    return QIcon(os.path.join(ICONS_DIR, name))
+
 
 class SelectionFilter:
     def __init__(self, iface):
@@ -54,13 +64,13 @@ class SelectionFilter:
         self.iface = iface
 
         self.create_filter_action = QAction(
-            QIcon(os.path.join(os.path.dirname(__file__), "icons/sf_icon.svg")), QCoreApplication.translate("filterSelected", "&Show selected feature(s) only"))
+            plugin_icon(), QCoreApplication.translate("filterSelected", "&Show selected feature(s) only"))
         self.create_hide_filter_action = QAction(
-            QIcon(os.path.join(os.path.dirname(__file__), "icons/sf_hide_icon.svg")), QCoreApplication.translate("hideSelected", "&Hide selected feature(s)"))
+            plugin_icon("sf_hide_icon.svg"), QCoreApplication.translate("hideSelected", "&Hide selected feature(s)"))
         self.create_clear_filter_action = QAction(
-            QIcon(os.path.join(os.path.dirname(__file__), "icons/sf_clear_icon.svg")), QCoreApplication.translate("clearFilterSelected", "&Clear filter"))
+            plugin_icon("sf_clear_icon.svg"), QCoreApplication.translate("clearFilterSelected", "&Clear filter"))
         self.set_unique_field_action = QAction(
-            QIcon(os.path.join(os.path.dirname(__file__), "icons/sf_field_icon.svg")), QCoreApplication.translate("showSetUniqueFieldPopup", "Se&t field"))
+            plugin_icon("sf_field_icon.svg"), QCoreApplication.translate("showSetUniqueFieldPopup", "Se&t field"))
 
     def initGui(self):    
         QgsProject.instance().layerWasAdded.connect(self.updateFilterActions)

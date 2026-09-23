@@ -45,7 +45,7 @@ tags=python
 
 homepage=https://github.com/knwin/SelectionFilter
 category=Vector
-icon=icon.png
+icon=icons/sf_plugin_icon.svg
 # experimental flag
 experimental=False
 
