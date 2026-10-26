@@ -3,7 +3,7 @@
 # This file should be included when you package your plugin.# Mandatory items:
 
 [general]
-name=Selection as Filter
+name=Selection as Filter - Last Mile
 qgisMinimumVersion=3.34
 qgisMaximumVersion=4.99
 
